@@ -279,8 +279,11 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
+        use_critic = need_critic(config)
+
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
+        if use_critic:
+            self.add_critic_worker(config)
 
         self.add_reward_model_resource_pool(config)
 
@@ -291,7 +294,7 @@ class TaskRunner:
         validate_config(
             config=config,
             use_reference_policy=need_reference_policy(config),
-            use_critic=need_critic(config),
+            use_critic=use_critic,
         )
 
         # Download the checkpoint from HDFS to the local machine.

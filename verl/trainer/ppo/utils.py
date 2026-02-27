@@ -85,9 +85,17 @@ def need_reward_model(
 
 def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
+    if config.algorithm.adv_estimator == AdvantageEstimator.GPPO:
+        if config.critic.enable:
+            warnings.warn(
+                "GPPO uses actor-side advantage prediction and does not use critic. Ignoring critic.enable=True.",
+                stacklevel=2,
+            )
+        return False
+
     if config.critic.enable is not None:
         return bool(config.critic.enable)
-    elif config.algorithm.adv_estimator in [AdvantageEstimator.GAE, AdvantageEstimator.GPPO]:
+    elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
         return True
     else:
         warnings.warn(
