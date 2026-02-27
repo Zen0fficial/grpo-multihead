@@ -19,8 +19,10 @@ Single Process Actor
 
 import logging
 import os
+from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -78,6 +80,18 @@ class DataParallelPPOActor(BasePPOActor):
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_prefix_grouper={self.use_prefix_grouper}")
 
+        self.predict_advantage_head = bool(getattr(self.config, "predict_advantage_head", False))
+        self._last_advantage_prediction = None
+        if self.predict_advantage_head and self.use_fused_kernels:
+            raise ValueError("predict_advantage_head requires use_fused_kernels=False")
+        if self.predict_advantage_head and self.use_prefix_grouper:
+            raise ValueError("predict_advantage_head requires use_prefix_grouper=False")
+        if self.predict_advantage_head and self.config.loss_agg_mode in ("token-mean", "seq-mean-token-mean"):
+            raise ValueError(
+                "predict_advantage_head requires a sequence-aware aggregation mode "
+                "that does not divide by per-sequence token count (e.g., seq-mean-token-sum)."
+            )
+
         if self.config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
         else:
@@ -124,6 +138,8 @@ class DataParallelPPOActor(BasePPOActor):
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
+        need_advantage_prediction = self.predict_advantage_head and self.actor_module.training
+        advantage_prediction = None
         # PrefixGrouper path for shared-prefix optimization
         if self.use_prefix_grouper:
             can_use_pg = (
@@ -146,6 +162,7 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
         response_length = micro_batch["responses"].size(-1)
+        response_mask = micro_batch.get("response_mask", None)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -247,6 +264,7 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_hidden_states=need_advantage_prediction,
                     **extra_args,
                 )  # prevent model thinks we are generating
 
@@ -285,6 +303,20 @@ class DataParallelPPOActor(BasePPOActor):
                             else torch.utils.checkpoint.checkpoint(
                                 self.calculate_sum_pi_squared_from_logits, logits_rmpad
                             )
+                        )
+
+                    if need_advantage_prediction:
+                        last_hidden = self._get_last_hidden_state(output)
+                        advantage_rmpad = self._compute_advantage_unpadded(
+                            last_hidden=last_hidden,
+                            action_token_ids=input_ids_rmpad_rolled,
+                            response_length=response_length,
+                            indices=indices,
+                            batch_size=batch_size,
+                            seqlen=seqlen,
+                            pad_size=pad_size if self.use_ulysses_sp else 0,
+                            response_mask=response_mask,
+                            is_mask_all_zero=is_mask_all_zero,
                         )
 
                 # gather log_prob if sp > 1
@@ -342,6 +374,8 @@ class DataParallelPPOActor(BasePPOActor):
                     # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if need_advantage_prediction:
+                    advantage_prediction = advantage_rmpad
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -355,6 +389,7 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_hidden_states=need_advantage_prediction,
                     **extra_args,
                 )  # prevent model thinks we are generating
 
@@ -380,13 +415,126 @@ class DataParallelPPOActor(BasePPOActor):
                             if not sum_pi_squared_checkpointing
                             else torch.utils.checkpoint.checkpoint(self.calculate_sum_pi_squared_from_logits, logits)
                         )
+                    if need_advantage_prediction:
+                        last_hidden = self._get_last_hidden_state(output)
+                        advantage_prediction = self._compute_advantage_padded(
+                            last_hidden=last_hidden,
+                            action_token_ids=micro_batch["responses"],
+                            response_length=response_length,
+                            response_mask=response_mask,
+                        )
 
             outputs = {"log_probs": log_probs}
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if need_advantage_prediction:
+                outputs["advantage_preds"] = advantage_prediction
+                self._last_advantage_prediction = advantage_prediction
             return outputs
+
+    def _get_advantage_state_proj_module(self):
+        proj = getattr(self.actor_module, "advantage_state_proj", None)
+        if proj is not None:
+            return proj
+        wrapped = getattr(self.actor_module, "module", None)
+        if wrapped is not None:
+            proj = getattr(wrapped, "advantage_state_proj", None)
+        if proj is None:
+            wrapped = getattr(self.actor_module, "_fsdp_wrapped_module", None)
+            if wrapped is not None:
+                proj = getattr(wrapped, "advantage_state_proj", None)
+        return proj
+
+    def _get_advantage_head_module(self):
+        head = getattr(self.actor_module, "advantage_head", None)
+        if head is not None:
+            return head
+        wrapped = getattr(self.actor_module, "module", None)
+        if wrapped is not None:
+            head = getattr(wrapped, "advantage_head", None)
+        if head is None:
+            wrapped = getattr(self.actor_module, "_fsdp_wrapped_module", None)
+            if wrapped is not None:
+                head = getattr(wrapped, "advantage_head", None)
+        return head
+
+    def _get_last_hidden_state(self, output):
+        hidden_states = getattr(output, "hidden_states", None)
+        if hidden_states is None:
+            raise RuntimeError(
+                "predict_advantage_head=True requires hidden_states from actor forward. "
+                "Set model.override_config.output_hidden_states=true."
+            )
+        return hidden_states[-1]
+
+    def _project_advantage_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        proj = self._get_advantage_state_proj_module()
+        if proj is None:
+            raise RuntimeError("advantage_state_proj is not initialized on actor module")
+        return proj(hidden)
+
+    def _gather_action_advantage(self, projected_hidden: torch.Tensor, action_token_ids: torch.Tensor) -> torch.Tensor:
+        head = self._get_advantage_head_module()
+        if head is None:
+            raise RuntimeError("advantage_head is not initialized on actor module")
+        if projected_hidden.shape[:-1] != action_token_ids.shape:
+            raise ValueError(
+                "Shape mismatch for action-conditioned advantage: "
+                f"hidden shape {projected_hidden.shape} vs action ids shape {action_token_ids.shape}"
+            )
+
+        flat_hidden = projected_hidden.reshape(-1, projected_hidden.size(-1))
+        flat_action_ids = action_token_ids.reshape(-1).to(device=flat_hidden.device, dtype=torch.long)
+        token_weight = head.weight.index_select(0, flat_action_ids)
+        scores = (flat_hidden * token_weight).sum(dim=-1)
+        if head.bias is not None:
+            scores = scores + head.bias.index_select(0, flat_action_ids)
+        return scores.reshape(action_token_ids.shape)
+
+    def _compute_advantage_unpadded(
+        self,
+        last_hidden: torch.Tensor,
+        action_token_ids: torch.Tensor,
+        response_length: int,
+        indices: torch.Tensor,
+        batch_size: int,
+        seqlen: int,
+        pad_size: int,
+        response_mask: Optional[torch.Tensor] = None,
+        is_mask_all_zero: bool = False,
+    ) -> torch.Tensor:
+        hidden = last_hidden
+        if hidden.dim() == 3 and hidden.size(0) == 1:
+            hidden = hidden.squeeze(0)
+
+        projected_hidden = self._project_advantage_hidden(hidden)
+        advantage = self._gather_action_advantage(projected_hidden, action_token_ids)
+        if self.use_ulysses_sp:
+            advantage = gather_outputs_and_unpad(advantage, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+        if is_mask_all_zero:
+            advantage = advantage[:0]
+        advantage = pad_input(hidden_states=advantage.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
+        advantage = advantage.squeeze(-1)[:, -response_length - 1 : -1]
+        if response_mask is not None:
+            advantage = advantage * response_mask.to(dtype=advantage.dtype)
+        return advantage
+
+    def _compute_advantage_padded(
+        self,
+        last_hidden: torch.Tensor,
+        action_token_ids: torch.Tensor,
+        response_length: int,
+        response_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        projected_hidden = self._project_advantage_hidden(last_hidden)
+        # Next-token alignment: h_{t-1} predicts the realized action a_t.
+        projected_hidden = projected_hidden[:, -response_length - 1 : -1, :]
+        advantage = self._gather_action_advantage(projected_hidden, action_token_ids)
+        if response_mask is not None:
+            advantage = advantage * response_mask.to(dtype=advantage.dtype)
+        return advantage
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -515,6 +663,8 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if self.predict_advantage_head:
+            select_keys.append("advantage_targets")
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
         if self.config.use_kl_loss:
@@ -545,9 +695,62 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
+            "actor/advantage_loss": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
-            for batch_idx, mini_batch in enumerate(mini_batches):
+            if self.predict_advantage_head:
+                for mini_batch in mini_batches:
+                    if self.config.use_dynamic_bsz:
+                        max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                        micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    else:
+                        self.gradient_accumulation = (
+                            self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        )
+                        micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                    self.actor_optimizer.zero_grad()
+                    for micro_batch in micro_batches:
+                        micro_batch = micro_batch.to(get_device_id())
+                        model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+                        response_mask = model_inputs["response_mask"]
+
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+
+                        outputs = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=False,
+                        )
+                        advantage_predictions = outputs.get("advantage_preds", None)
+                        if advantage_predictions is None:
+                            raise RuntimeError(
+                                "predict_advantage_head=True but no action-conditioned advantage prediction was produced."
+                            )
+                        targets = model_inputs.get("advantage_targets", None)
+                        if targets is None:
+                            raise KeyError("advantage_targets missing from actor batch while predict_advantage_head=True")
+
+                        mask = response_mask.to(dtype=advantage_predictions.dtype)
+                        predicted_sum = torch.sum(advantage_predictions * mask, dim=-1)
+                        targets = targets.to(device=predicted_sum.device, dtype=predicted_sum.dtype)
+                        advantage_loss = F.mse_loss(predicted_sum, targets)
+
+                        loss = advantage_loss * loss_scale_factor
+                        if self.scaler is not None:
+                            self.scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+
+                        metrics["actor/advantage_loss"] += advantage_loss.detach().item() * loss_scale_factor
+
+                    adv_grad_norm = self._optimizer_step()
+                    append_to_dict(metrics, {"actor/adv_grad_norm": adv_grad_norm.detach().item()})
+
+            for mini_batch in mini_batches:
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -583,6 +786,13 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+                    if self.predict_advantage_head:
+                        advantage_predictions = outputs.get("advantage_preds", None)
+                        if advantage_predictions is None:
+                            raise RuntimeError(
+                                "predict_advantage_head=True but no action-conditioned advantage prediction was produced."
+                            )
+                        advantages = advantage_predictions.detach()
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:

@@ -96,6 +96,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    GPPO = "gppo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -355,6 +356,43 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GPPO)
+def compute_gppo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute grouped scalar targets and token-shaped placeholders for GPPO.
+
+    Returns:
+        advantages: Group-normalized scalar advantage broadcast to response tokens.
+        returns: Sequence outcome reward broadcast to response tokens.
+        scalar_advantages: Unbroadcasted grouped scalar target, shape (bs,).
+    """
+    with torch.no_grad():
+        sequence_rewards = token_level_rewards.sum(dim=-1)
+        group_ids = as_torch_index(index, device=sequence_rewards.device)
+        mean_g, std_g, _ = group_mean_std(sequence_rewards, group_ids, eps=epsilon, device=sequence_rewards.device)
+
+        if config is not None:
+            if hasattr(config, "get"):
+                norm_adv_by_std_in_grpo = config.get("norm_adv_by_std_in_grpo", norm_adv_by_std_in_grpo)
+            else:
+                norm_adv_by_std_in_grpo = getattr(config, "norm_adv_by_std_in_grpo", norm_adv_by_std_in_grpo)
+
+        scalar_advantages = sequence_rewards - mean_g[group_ids]
+        if norm_adv_by_std_in_grpo:
+            scalar_advantages = scalar_advantages / (std_g[group_ids] + epsilon)
+
+        advantages = scalar_advantages.unsqueeze(-1) * response_mask
+        returns = sequence_rewards.unsqueeze(-1) * response_mask
+        return advantages, returns, scalar_advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")

@@ -187,6 +187,21 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GPPO:
+        uid_index = data.non_tensor_batch.get("uid")
+        if uid_index is None:
+            raise KeyError("GPPO requires 'uid' in non_tensor_batch for per-prompt grouping")
+
+        advantages, returns, scalar_advantages = core_algos.compute_gppo_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=uid_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.batch["advantage_targets"] = scalar_advantages
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)

@@ -21,6 +21,7 @@ import logging
 import os
 import warnings
 from dataclasses import asdict
+from typing import Optional
 
 import psutil
 import torch
@@ -30,6 +31,7 @@ from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
+from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
@@ -120,6 +122,58 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
+
+
+def _resolve_hidden_size(model_config) -> Optional[int]:
+    hidden_size = getattr(model_config, "hidden_size", None)
+    if hidden_size is not None:
+        return hidden_size
+    text_config = getattr(model_config, "text_config", None)
+    if text_config is not None:
+        return getattr(text_config, "hidden_size", None)
+    return None
+
+
+def _resolve_vocab_size(model: nn.Module, model_config) -> Optional[int]:
+    vocab_size = getattr(model_config, "vocab_size", None)
+    if vocab_size is not None:
+        return vocab_size
+    text_config = getattr(model_config, "text_config", None)
+    if text_config is not None:
+        vocab_size = getattr(text_config, "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    if callable(get_output_embeddings):
+        output_embeddings = get_output_embeddings()
+        if output_embeddings is not None and hasattr(output_embeddings, "weight"):
+            return output_embeddings.weight.shape[0]
+    return None
+
+
+def _maybe_attach_advantage_head(model: nn.Module, enable_head: bool, torch_dtype: torch.dtype) -> None:
+    if not enable_head:
+        return
+
+    hidden_size = _resolve_hidden_size(model.config)
+    if hidden_size is None:
+        raise ValueError("predict_advantage_head=True but model hidden size could not be determined")
+    vocab_size = _resolve_vocab_size(model, model.config)
+    if vocab_size is None:
+        raise ValueError("predict_advantage_head=True but model vocab size could not be determined")
+
+    setattr(model.config, "output_hidden_states", True)
+    setattr(model.config, "use_return_dict", True)
+
+    # Use a separate representation h_t^A for advantage prediction.
+    advantage_state_proj = nn.Linear(hidden_size, hidden_size)
+    advantage_state_proj.to(dtype=torch_dtype)
+
+    # Advantage scores over actions (vocabulary), not LM logits.
+    advantage_head = nn.Linear(hidden_size, vocab_size)
+    advantage_head.to(dtype=torch_dtype)
+    model.advantage_state_proj = advantage_state_proj
+    model.advantage_head = advantage_head
 
 
 def get_vl_model_vision_tower(vl_model_instance):
@@ -472,6 +526,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+        if role == "actor":
+            enable_advantage_head = self.config.actor.get("predict_advantage_head", False)
+            _maybe_attach_advantage_head(actor_module, enable_advantage_head, torch_dtype)
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
