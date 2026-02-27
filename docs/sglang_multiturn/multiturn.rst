@@ -296,7 +296,7 @@ This method works well for Qwen3 series. However, Qwen/QwQ-32B currently has a b
 .. code-block:: bash
 
     pip install huggingface_hub
-    hf download Qwen/QwQ-32B --revision refs/pr/81
+    huggingface-cli download Qwen/QwQ-32B --revision refs/pr/81
 
 .. _fix: https://huggingface.co/Qwen/QwQ-32B/discussions/81
 

@@ -4,7 +4,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation ov
 
 
 # 0. download the model
-hf download moonshotai/Moonlight-16B-A3B-Instruct
+huggingface-cli download moonshotai/Moonlight-16B-A3B-Instruct
 
 # 1. convert the model to mcore format
 # change the HF_MODEL_PATH and DIST_CKPT_PATH to your own path

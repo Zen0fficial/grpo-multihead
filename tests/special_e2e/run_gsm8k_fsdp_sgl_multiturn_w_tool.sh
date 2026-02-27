@@ -3,7 +3,7 @@
 
 set -x
 
-#hf download Qwen/Qwen2.5-3B-Instruct --local-dir $HOME/models/Qwen/Qwen2.5-3B-Instruct
+#huggingface-cli download Qwen/Qwen2.5-3B-Instruct --local-dir $HOME/models/Qwen/Qwen2.5-3B-Instruct
 
 ulimit -n 65535
 
