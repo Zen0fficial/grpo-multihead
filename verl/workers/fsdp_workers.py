@@ -157,7 +157,10 @@ def _maybe_attach_advantage_head(model: torch.nn.Module, enable_head: bool, torc
         raise ValueError("predict_advantage_head=True but model vocab size could not be determined")
 
     setattr(model.config, "output_hidden_states", True)
-    setattr(model.config, "use_return_dict", True)
+    # In HF configs, `use_return_dict` is commonly a read-only property backed by
+    # `return_dict`, so set the writable source field to avoid AttributeError.
+    if hasattr(model.config, "return_dict"):
+        setattr(model.config, "return_dict", True)
 
     # Separate representation h_t^A for advantage prediction.
     advantage_state_proj = torch.nn.Linear(hidden_size, hidden_size)
